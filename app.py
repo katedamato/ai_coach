@@ -4,35 +4,6 @@ import datetime
 import requests
 import numpy as np
 
-# --- 1. DATA & CONSTANTS ---
-# (Keep your plan_data dictionary here)
-
-def load_and_scale_plan(data, age, gender, weeks_to_race):
-    df = pd.DataFrame(data['workouts'])
-    df['day_idx'] = df.index % 7
-    df['week'] = (df.index // 7) + 1
-    
-    # Scaling Logic
-    age_f = 1.0 - (max(0, age - 40) * 0.005)
-    gen_f = 0.9 if gender == "Female" else 1.0
-    time_f = 1.2 if weeks_to_race < 12 else 1.0
-    master_mult = age_f * gen_f * time_f
-    
-    df['scaled_miles'] = (df['totalDistance'] * master_mult).round(2)
-    return df, master_mult
-
-# --- 2. HR ZONE LOGIC (Karvonen Formula) ---
-def get_hr_zones(age, resting_hr):
-    max_hr = 211 - (0.64 * age)
-    hrr = max_hr - resting_hr
-    zones = {
-        "Easy (Recovery)": (f"{int(hrr * 0.60 + resting_hr)}-{int(hrr * 0.70 + resting_hr)} BPM"),
-        "Moderate (Aerobic)": (f"{int(hrr * 0.70 + resting_hr)}-{int(hrr * 0.80 + resting_hr)} BPM"),
-        "Hard (Tempo)": (f"{int(hrr * 0.80 + resting_hr)}-{int(hrr * 0.90 + resting_hr)} BPM")
-    }
-    return zones
-##Plan Data 
-
 plan_data = {
   'id': "1f16b01b-3dd4-498b-96b8-17b6c304288b",
   'title': "Hansons Beginner Half Marathon",
@@ -478,94 +449,105 @@ plan_data = {
   ],
 } 
 
+import streamlit as st
+import pandas as pd
+import numpy as np
+import datetime
+import requests
+import kagglehub
 
-def load_hanson_plan(data):
-    # 1. Convert workouts list to a DataFrame
-    df_daily = pd.DataFrame(data['workouts'])
+# --- 1. DATA LOADING & CLEANING ---
+@st.cache_data
+def load_and_refine_data(u_age, u_gender):
+    # Download Kaggle Files
+    act_path = kagglehub.dataset_download("mmaelicke/run-activites")
+    out_path = kagglehub.dataset_download("likithagedipudi/run-club-marathon-performance-dataset")
     
-    # 2. Fix the 26.2 typo if title is Half Marathon
-    if "Half Marathon" in data['title']:
-        df_daily.loc[df_daily['description'] == "Race Day!", 'total_distance'] = 13.1
+    activities = pd.read_csv(f"{act_path}/activities.csv")
+    outcomes = pd.read_csv(f"{out_path}/train.csv")
+
+    # Clean Activities (from your previous logic)
+    activities['miles'] = pd.to_numeric(activities['Distance (Raw)'], errors='coerce') * 0.621371
+    raw_dur = pd.to_numeric(activities['Duration (Raw Seconds)'], errors='coerce')
+    activities['min'] = np.where(raw_dur > 10000, raw_dur / 60000, raw_dur / 60)
+    activities['pace'] = activities['min'] / activities['miles']
     
-    # 3. Create a Day and Week counter
-    df_daily['day'] = df_daily.index + 1
-    df_daily['week'] = (df_daily.index // 7) + 1
+    # Matching Logic: Find top 10% performers in user's demographic
+    demo_outcomes = outcomes[(outcomes['age'] >= u_age - 5) & 
+                             (outcomes['age'] <= u_age + 5) & 
+                             (outcomes['gender'] == u_gender)]
     
-    # 4. Aggregate to Weekly for Outcome Matching
-    df_weekly = df_daily.groupby('week').agg({
-        'totalDistance': 'sum',
-        'description': 'count' # Number of active sessions
-    }).rename(columns={'totalDistance': 'weekly_mileage', 'description': 'sessions_per_week'})
+    # Get the "High Performance" threshold (e.g., top 25% finish times)
+    perf_threshold = demo_outcomes['performance_score'].quantile(0.75) 
+    top_performers = demo_outcomes[demo_outcomes['performance_score'] >= perf_threshold]
     
-    return df_daily, df_weekly
+    # Derive "Ideal" mileage and conditions
+    avg_top_mileage = top_performers['weekly_mileage'].mean()
+    common_conditions = top_performers['weather_condition'].mode()[0]
+    
+    return avg_top_mileage, common_conditions, activities
 
-# Run the import
-df_daily, df_weekly = load_hanson_plan(plan_data)
+# --- 2. STRAVA API (Zones & Pace) ---
+def get_strava_bio_data(c_id, c_secret, r_token):
+    auth_url = "https://www.strava.com/oauth/token"
+    res = requests.post(auth_url, data={'client_id': c_id, 'client_secret': c_secret, 'refresh_token': r_token, 'grant_type': 'refresh_token'}).json()
+    access_token = res['access_token']
+    
+    # Get Athlete Zones (Heart Rate & Pace)
+    header = {'Authorization': f'Bearer {access_token}'}
+    zones = requests.get("https://www.strava.com/api/v3/athlete/zones", headers=header).json()
+    
+    # Get recent activity for baseline pace
+    recent = requests.get("https://www.strava.com/api/v3/athlete/activities", headers=header, params={'per_page': 5}).json()
+    avg_pace = pd.DataFrame(recent)['average_speed'].mean() * 2.23694 # m/s to mph then converted to pace
+    return zones, (60 / avg_pace)
 
+# --- 3. APP UI & ADJUSTMENT LOGIC ---
+st.title("🏃‍♂️ Hanson AI: Podium-Optimized Coach")
 
-# --- 3. APP INTERFACE ---
-st.set_page_config(page_title="AI Coach", layout="wide")
-st.title("🏃‍♂️ Hanson AI Dashboard")
-
-# Sidebar Configuration
 with st.sidebar:
-    st.header("Personal Data")
-    age = st.number_input("Age", 18, 80, 22)
-    gender = st.selectbox("Gender", ["Male", "Female"])
-    rest_hr = st.number_input("Resting HR (from Watch/Strava)", 30, 100, 55)
-    race_date = st.date_input("Race Date", datetime.date(2026, 11, 1))
+    u_age = st.number_input("Age", 18, 80, 25)
+    u_gender = st.selectbox("Gender", ["Male", "Female"])
+    st.divider()
+    s_id = st.text_input("Strava Client ID", type="password")
+    s_secret = st.text_input("Strava Secret", type="password")
+    s_token = st.text_input("Strava Refresh Token", type="password")
 
-# Initialize Plan
-weeks_left = (race_date - datetime.date.today()).days // 7
-df_plan, multiplier = load_and_scale_plan(plan_data, age, gender, weeks_left)
-current_week_num = max(1, min(18, 18 - weeks_left))
+# Execute Kaggle Insight
+ideal_mileage, best_weather, clean_act = load_and_refine_data(u_age, u_gender)
 
-# --- 4. TODAY'S VIEW ---
-st.subheader("📍 Today's Prescription")
+# Initialize Session Data
+if st.button("Sync & Personalize Plan"):
+    s_zones, s_pace = get_strava_bio_data(s_id, s_secret, s_token)
+    st.session_state['s_zones'] = s_zones
+    st.session_state['s_pace'] = s_pace
+    st.success("Biological Calibration Complete.")
+
+# --- 4. THE ADJUSTED SCHEDULE ---
+st.subheader("Your High-Performance Plan")
+st.write(f"💡 *Insights:* Top performers in your demographic focus on **{int(ideal_mileage)} miles/week** and thrive in **{best_weather}** conditions.")
+
+# Map Strava Zones to Plan
+hr_zones = st.session_state.get('s_zones', {}).get('heart_rate', {}).get('zones', [])
+pace_zones = st.session_state.get('s_zones', {}).get('pace', {}).get('zones', [])
+
+def get_zone_label(desc):
+    if "HMP" in desc: return "Zone 4 (Threshold)"
+    if "Easy" in desc: return "Zone 2 (Aerobic)"
+    return "Zone 1 (Recovery)"
+
+# Display today's detail
+weeks_to_race = (datetime.date(2026, 11, 1) - datetime.date.today()).days // 7
+curr_week = 18 - weeks_to_race
 today_idx = datetime.datetime.now().weekday()
-today_data = df_plan[(df_plan['week'] == current_week_num) & (df_plan['day_idx'] == today_idx)].iloc[0]
 
-# Mocking Strava ACWR for display - (Replace with your actual Strava function call)
-acwr = 1.15 
-adj = 0.8 if acwr > 1.3 else 1.0
+# Base logic: Scale current mileage toward the 'ideal_mileage' found in Outcomes
+# If Base Plan says 30mpw but Kaggle Podium says 45mpw, we adjust the scale.
+adjustment_factor = ideal_mileage / 40 # Assuming 40 is standard base
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Distance", f"{round(today_data['scaled_miles'] * adj, 2)} mi", delta=f"{adj*100}% Load")
-col2.metric("Target Zone", "Hard (Tempo)" if "HMP" in today_data['description'] else "Easy")
-col3.metric("Status", "🟢 Optimal" if adj == 1.0 else "🟡 Fatigue Warning")
+plan_df = pd.DataFrame(plan_data['workouts'])
+plan_df['scaled_miles'] = (plan_df['totalDistance'] * adjustment_factor).round(1)
 
-st.info(f"**Workout:** {today_data['description']}")
-
-# --- 5. WEEKLY CHECKLIST ---
-st.divider()
-st.subheader(f"📅 Week {current_week_num} Schedule")
-
-# Filter for current week
-weekly_view = df_plan[df_plan['week'] == current_week_num][['day_idx', 'description', 'scaled_miles']].copy()
-days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-weekly_view['Day'] = [days[i] for i in weekly_view['day_idx']]
-weekly_view['Done'] = False # Initial state
-
-# Interactive Table with Checkboxes
-edited_df = st.data_editor(
-    weekly_view[['Day', 'description', 'scaled_miles', 'Done']],
-    column_config={
-        "Done": st.column_config.CheckboxColumn("Completed?", default=False),
-        "scaled_miles": "Miles",
-        "description": "Workout Details"
-    },
-    disabled=["Day", "description", "scaled_miles"],
-    hide_index=True,
-)
-
-# --- 6. HR ZONES & FULL PLAN ---
-st.divider()
-tab1, tab2 = st.tabs(["💓 Heart Rate Zones", "🗺 Full 18-Week Roadmap"])
-
-with tab1:
-    zones = get_hr_zones(age, rest_hr)
-    st.table(pd.DataFrame(zones.items(), columns=["Zone", "Range"]))
-
-with tab2:
-    st.write("Full training progression scaled to your profile:")
-    st.dataframe(df_plan[['week', 'day_idx', 'description', 'scaled_miles']], height=400)
+st.write(f"### Today's Goal: {plan_df.iloc[today_idx]['scaled_miles']} Miles")
+st.metric("Target Heart Rate", hr_zones[1]['max'] if hr_zones else "145 BPM", "Easy Pace")
+st.info(f"**Strategy:** {plan_df.iloc[today_idx]['description']}")
