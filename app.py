@@ -449,144 +449,132 @@ plan_data = {
   ],
 } 
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import datetime
-import requests
-import kagglehub
 
-# --- 1. DATA LOADING & ROBUST CLEANING ---
+# --- 1. DATA ENGINE (PACE-BASED SCALING) ---
 @st.cache_data
-def load_and_refine_data(u_age, u_gender):
+def load_pace_matched_data(u_age, u_gender, u_pace):
     try:
-        # Download Kaggle Files
         act_path = kagglehub.dataset_download("mmaelicke/run-activites")
-        out_path = kagglehub.dataset_download("likithagedipudi/run-club-marathon-performance-dataset")
-        
         activities = pd.read_csv(f"{act_path}/activities.csv")
-        outcomes = pd.read_csv(f"{out_path}/train.csv") # This is the marathon results file
-
-        # Clean Activities (Kaggle Dataset 1)
-        activities['miles'] = pd.to_numeric(activities['Distance (Raw)'], errors='coerce') * 0.621371
+        
+        # Clean activities for pace matching
+        activities['dist_mi'] = pd.to_numeric(activities['Distance (Raw)'], errors='coerce') * 0.621371
         raw_dur = pd.to_numeric(activities['Duration (Raw Seconds)'], errors='coerce')
-        activities['min'] = np.where(raw_dur > 10000, raw_dur / 60000, raw_dur / 60)
+        activities['dur_min'] = np.where(raw_dur > 10000, raw_dur / 60000, raw_dur / 60)
+        activities['avg_pace'] = activities['dur_min'] / activities['dist_mi']
         
-        # Demographic Matching (Kaggle Dataset 2: Outcomes)
-        # We look for people similar to you
-        demo_mask = (outcomes['age'].between(u_age-5, u_age+5)) & (outcomes['gender'].str.lower() == u_gender.lower())
-        demo_outcomes = outcomes[demo_mask]
-
-        if demo_outcomes.empty:
-            return 40.0, "Cool", activities # Fallback defaults
-
-        # Identify 'High Performance' (The fastest 25% of your demographic)
-        # Using 'finish_time' because 'performance_score' was missing
-        time_col = 'finish_time' if 'finish_time' in outcomes.columns else outcomes.columns[1] 
-        perf_threshold = demo_outcomes[time_col].quantile(0.25) 
-        top_performers = demo_outcomes[demo_outcomes[time_col] <= perf_threshold]
+        # Filter: Find others at your pace (+/- 30 seconds) in your demographic
+        pace_min, pace_max = u_pace - 0.5, u_pace + 0.5
+        matched_peers = activities[
+            (activities['avg_pace'].between(pace_min, pace_max)) & 
+            (activities['dist_mi'] > 2) # Real runs only
+        ]
         
-        # Derive Ideal Mileage (Looking at what the fast people in your age group do)
-        # Note: If 'weekly_mileage' is missing, we use a calculated baseline
-        mile_col = 'weekly_mileage' if 'weekly_mileage' in outcomes.columns else 'mileage'
-        avg_top_mileage = top_performers[mile_col].mean() if mile_col in top_performers.columns else 45.0
-        
-        return avg_top_mileage, "Optimal", activities
-    except Exception as e:
-        st.error(f"Data Alignment Error: {e}")
-        return 40.0, "Variable", pd.DataFrame()
+        if matched_peers.empty:
+            return 35.0 # Fallback weekly mileage
+            
+        # Calculate their typical weekly volume
+        peer_weekly_avg = matched_peers['dist_mi'].mean() * 4 # Approximation of weekly load
+        return peer_weekly_avg
+    except:
+        return 35.0
 
-# --- 2. STRAVA BIO-DATA FETCH ---
-def get_strava_bio_data(c_id, c_secret, r_token):
-    try:
-        auth_url = "https://www.strava.com/oauth/token"
-        res = requests.post(auth_url, data={
-            'client_id': c_id, 'client_secret': c_secret, 
-            'refresh_token': r_token, 'grant_type': 'refresh_token'
-        }).json()
-        access_token = res['access_token']
-        header = {'Authorization': f'Bearer {access_token}'}
-        
-        # Get Athlete Zones (Heart Rate and Pace)
-        zones = requests.get("https://www.strava.com/api/v3/athlete/zones", headers=header).json()
-        return zones
-    except Exception as e:
-        st.warning("Could not connect to Strava. Using base HR formulas.")
-        return None
+# --- 2. PLAN GENERATOR (REST DAYS & FULL LAYOUT) ---
+def generate_custom_plan(base_plan, rest_days, scale_factor):
+    df = pd.DataFrame(base_plan['workouts'])
+    df['day_idx'] = df.index % 7
+    df['week'] = (df.index // 7) + 1
+    df['scaled_miles'] = (df['totalDistance'] * scale_factor).round(1)
+    
+    # Rest Day Logic: Find the days with the lowest mileage and set to 0
+    if rest_days > 0:
+        for w in df['week'].unique():
+            week_mask = df['week'] == w
+            # Don't turn "Hard" workouts or Long Runs into rest days if possible
+            # We sort by mileage ascending to pick the easiest days
+            potential_rest_indices = df[week_mask].sort_values(by='scaled_miles').index[:rest_days]
+            df.loc[potential_rest_indices, 'scaled_miles'] = 0
+            df.loc[potential_rest_indices, 'description'] = "Scheduled Rest Day"
+            
+    return df
 
-# --- 3. UI & COACHING ENGINE ---
-st.set_page_config(page_title="AI Podium Coach", layout="wide")
-st.title("🏆 AI Hanson Coach")
+# --- 3. APP INTERFACE ---
+st.set_page_config(page_title="Pace-Matched Coach", layout="wide")
+
+# Persistent Checklist State
+if 'completed' not in st.session_state:
+    st.session_state.completed = {}
 
 with st.sidebar:
-    st.header("1. Personal Specs")
-    u_age = st.number_input("Age", 18, 80, 25)
+    st.header("👤 Profile & Goals")
+    u_age = st.number_input("Age", 18, 80, 30)
     u_gender = st.selectbox("Gender", ["Male", "Female"])
-    u_rest_hr = st.number_input("Resting HR", 30, 100, 55)
-    
-    st.header("2. Strava Link")
+    u_pace = st.slider("Current Easy Pace (min/mile)", 6.0, 14.0, 10.0)
+    u_rest = st.slider("Desired Rest Days per Week", 0, 3, 1)
+    st.divider()
+    st.header("🔗 Strava API")
     s_id = st.text_input("Client ID", type="password")
     s_secret = st.text_input("Secret", type="password")
     s_token = st.text_input("Refresh Token", type="password")
+
+# Calculate Scale based on Peers
+peer_mileage = load_pace_matched_data(u_age, u_gender, u_pace)
+hanson_base = 40.0
+scaling_factor = peer_mileage / hanson_base
+
+# Generate customized plan
+full_plan = generate_custom_plan(plan_data, u_rest, scaling_factor)
+
+# --- 4. VIEW LAYOUTS ---
+tab1, tab2, tab3 = st.tabs(["🎯 Today", "📅 This Week", "🗺 Full Plan"])
+
+# Calculate Timing
+race_date = datetime.date(2026, 11, 1)
+weeks_left = (race_date - datetime.date.today()).days // 7
+curr_week = max(1, 18 - weeks_left)
+today_idx = datetime.datetime.now().weekday()
+
+with tab1:
+    today_run = full_plan[(full_plan['week'] == curr_week) & (full_plan['day_idx'] == today_idx)].iloc[0]
     
-    sync = st.button("Sync Biological Data")
+    st.subheader("Today's Prescription")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Distance", f"{today_run['scaled_miles']} mi")
+    c2.metric("Target Pace", f"{u_pace} min/mi")
+    c3.metric("Status", "Rest" if today_run['scaled_miles'] == 0 else "Active")
+    
+    st.info(f"**Workout:** {today_run['description']}")
+    
+    # Check-off Button
+    done_key = f"w{curr_week}d{today_idx}"
+    if st.button("Mark Today's Run as Completed ✅"):
+        st.session_state.completed[done_key] = True
+        st.success("Great job! Run logged.")
 
-# Load Global Insights
-ideal_mileage, cond, activities = load_and_refine_data(u_age, u_gender)
+with tab2:
+    st.subheader(f"Week {curr_week} Schedule")
+    this_week = full_plan[full_plan['week'] == curr_week].copy()
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    this_week['Day'] = days
+    
+    # Interactive Table for checking off
+    this_week['Done'] = [st.session_state.completed.get(f"w{curr_week}d{i}", False) for i in range(7)]
+    
+    edited_week = st.data_editor(
+        this_week[['Day', 'description', 'scaled_miles', 'Done']],
+        column_config={"Done": st.column_config.CheckboxColumn("Completed?")},
+        use_container_width=True,
+        key="weekly_editor"
+    )
 
-# Session State for Strava
-if sync:
-    st.session_state['zones'] = get_strava_bio_data(s_id, s_secret, s_token)
+with tab3:
+    st.subheader("The Full 18-Week Journey")
+    st.write(f"Scaled based on peers running {u_pace} min/mile pace.")
+    
+    # Simplified view of the whole plan
+    st.dataframe(
+        full_plan[['week', 'day_idx', 'description', 'scaled_miles']],
+        use_container_width=True,
+        height=500
+    )
 
-# --- 4. THE ADJUSTED PLAN ---
-# Baseline Hanson Week (Simplified for example)
-hanson_base_mileage = 35.0 
-# Scaling Factor: Ratio of what elites in your demo do vs base plan
-scaling_factor = ideal_mileage / hanson_base_mileage if ideal_mileage > 0 else 1.0
-
-st.info(f"📊 **Data Insight:** High-performers in the {u_age}yo {u_gender} demographic average **{ideal_mileage:.1f} miles/week**. Your plan has been scaled by **{scaling_factor:.2f}x** to match.")
-
-# Get Today's Workout from JSON (Mocking a row for logic)
-today_base_dist = 6.0 
-today_desc = "6 miles Easy Run with 4x100m Strides"
-scaled_dist = round(today_base_dist * scaling_factor, 1)
-
-# Zone Calculation
-strava_zones = st.session_state.get('zones')
-if strava_zones and 'heart_rate' in strava_zones:
-    # Use real Strava Zone 2 for Easy, Zone 4 for Tempo
-    z2 = strava_zones['heart_rate']['zones'][1]
-    z4 = strava_zones['heart_rate']['zones'][3]
-    target_hr = f"{z2['min']} - {z2['max']} BPM" if "Easy" in today_desc else f"{z4['min']} - {z4['max']} BPM"
-else:
-    # Fallback Karvonen
-    max_hr = 211 - (0.64 * u_age)
-    target_hr = f"{int((max_hr-u_rest_hr)*0.6 + u_rest_hr)} BPM (Generic)"
-
-# Dashboard
-col1, col2, col3 = st.columns(3)
-col1.metric("Today's Distance", f"{scaled_dist} mi")
-col2.metric("Target HR", target_hr)
-col3.metric("Demo Peak Mileage", f"{int(ideal_mileage)} mpw")
-
-st.success(f"**Workout:** {today_desc}")
-
-# --- 5. WEEKLY VIEW & CHECKLIST ---
-st.divider()
-st.subheader("This Week's Schedule")
-
-# Creating a mock weekly dataframe for demonstration
-week_data = pd.DataFrame({
-    'Day': ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-    'Workout': ["Easy Run", "Strength", "Tempo Run", "Easy Run", "Rest", "Long Run", "Easy Run"],
-    'Base Miles': [6, 0, 8, 6, 0, 10, 6],
-    'Done': [False] * 7
-})
-week_data['Scaled Miles'] = (week_data['Base Miles'] * scaling_factor).round(1)
-
-st.data_editor(
-    week_data[['Day', 'Workout', 'Scaled Miles', 'Done']],
-    column_config={"Done": st.column_config.CheckboxColumn("Completed?")},
-    use_container_width=True,
-    disabled=["Day", "Workout", "Scaled Miles"]
-)
